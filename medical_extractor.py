@@ -1,9 +1,10 @@
 
 import json
 import re
-import time
 
 from google import genai
+from google.genai import types
+from api_optimization import is_quota_exhaustion
 
 
 # ==========================================
@@ -14,75 +15,59 @@ MODELS = [
     "gemini-3.5-flash-lite",
     "gemini-3.8-flash"
 ]
+REQUEST_TIMEOUT_MS = 30_000
 
 
 # ==========================================
-# GEMINI RESPONSE WITH RETRY
+# GEMINI RESPONSE WITH BOUNDED MODEL FALLBACK
 # ==========================================
 
-def generate_response(client, prompt):
+def generate_response(client, prompt, metrics=None, stop_event=None):
 
     last_error = None
-    quota_error = None
 
     for model in MODELS:
-
-        for attempt in range(2):
-
-            try:
-                response = client.models.generate_content(
-                    model=model,
-                    contents=prompt,
-                    config={
-                        "response_mime_type": "application/json",
-                        "temperature": 0.1
-                    }
-                )
-
-                if not response.text:
-                    raise ValueError("Gemini returned an empty response.")
-
-                return response.text
-
-            except Exception as e:
-
-                last_error = e
-                error_message = str(e).upper()
-                daily_quota = (
-                    "GENERATE_CONTENT_FREE_TIER_REQUESTS" in error_message
-                    or "PER DAY" in error_message
-                    or "REQUESTS PER DAY" in error_message
-                )
-
-                if daily_quota:
-                    # Daily quota limits will not clear after a short retry.
-                    quota_error = e
-                    break
-
-                temporary_error = any(
-                    code in error_message
-                    for code in [
-                        "503",
-                        "UNAVAILABLE",
-                        "429",
-                        "RESOURCE_EXHAUSTED",
-                        "500",
-                        "INTERNAL"
-                    ]
-                )
-
-                if temporary_error and attempt == 0:
-                    time.sleep(2)
-                    continue
-
+        if stop_event is not None and stop_event.is_set():
+            raise RuntimeError("Gemini quota is exhausted; stopped before another call.")
+        try:
+            if metrics is not None:
+                metrics["api_calls"] += 1
+                if model not in metrics["models"]:
+                    metrics["models"].append(model)
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config={
+                    "response_mime_type": "application/json",
+                    "temperature": 0.1,
+                },
+            )
+            if not response.text:
+                raise ValueError("Gemini returned an empty response.")
+            usage = getattr(response, "usage_metadata", None)
+            if usage is not None and metrics is not None:
+                prompt_tokens = getattr(usage, "prompt_token_count", None)
+                output_tokens = getattr(usage, "candidates_token_count", None)
+                if prompt_tokens is not None or output_tokens is not None:
+                    metrics["token_metadata_available"] = True
+                    metrics["input_tokens"] += prompt_tokens or 0
+                    metrics["output_tokens"] += output_tokens or 0
+            return response.text
+        except Exception as error:
+            last_error = error
+            if is_quota_exhaustion(error):
+                if stop_event is not None:
+                    stop_event.set()
+                raise RuntimeError(
+                    "Gemini quota was exhausted (429 RESOURCE_EXHAUSTED). "
+                    "Wait for the quota reset or review the project's limits."
+                ) from error
+            fallback_error = str(error).upper()
+            if not any(code in fallback_error for code in (
+                "503", "UNAVAILABLE", "500", "INTERNAL", "404", "NOT_FOUND",
+                "504", "GATEWAY TIMEOUT", "TIMED OUT", "TIMEOUT", "DEADLINE EXCEEDED",
+            )):
                 break
-
-    if quota_error is not None:
-        raise RuntimeError(
-            "Gemini's daily request quota is exhausted for the available "
-            "model(s). Wait for the quota reset or enable billing/increase "
-            f"the API quota. Details: {quota_error}"
-        ) from quota_error
 
     raise RuntimeError(f"Gemini API request failed: {last_error}") from last_error
 
@@ -91,12 +76,18 @@ def generate_response(client, prompt):
 # EXTRACT MEDICAL TEST RESULTS
 # ==========================================
 
-def extract_medical_tests(report, api_key):
+def extract_medical_tests(report, api_key, metrics=None, on_stage=None, stop_event=None):
 
     if not api_key:
         raise ValueError("Gemini API key is required.")
 
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(
+            timeout=REQUEST_TIMEOUT_MS,
+            retry_options=types.HttpRetryOptions(attempts=1),
+        ),
+    )
 
     prompt = f"""
 You are a medical report information extraction assistant.
@@ -154,7 +145,11 @@ MEDICAL REPORT:
 {report}
 """
 
-    response_text = generate_response(client, prompt)
+    if on_stage:
+        on_stage("Extracting medical test results", "running")
+    response_text = generate_response(
+        client, prompt, metrics=metrics, stop_event=stop_event
+    )
 
     try:
         result = json.loads(response_text)
@@ -169,9 +164,15 @@ MEDICAL REPORT:
 
         result = json.loads(cleaned_text)
 
+    if not isinstance(result, dict):
+        raise ValueError("Invalid medical test data: expected a JSON object.")
+
     tests = result.get("tests", [])
 
-    if not isinstance(tests, list):
+    if not isinstance(tests, list) or any(not isinstance(test, dict) for test in tests):
         raise ValueError("Invalid medical test data returned by Gemini.")
+
+    if on_stage:
+        on_stage("Extracting medical test results", "complete")
 
     return tests
