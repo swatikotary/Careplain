@@ -1,0 +1,17 @@
+
+# Protect API keys and secrets
+.streamlit/secrets.toml
+
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+venv/
+.venv/
+
+# Environment variables
+.env
+
+# System files
+.DS_Store
